@@ -31,7 +31,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import braille_gen as bg  # noqa: E402
+import braille_gen_legacy as bg  # noqa: E402
 
 # --- Tunables ---------------------------------------------------------------
 

@@ -1,8 +1,22 @@
-"""Render gradient-damped random braille textures as RGBA PNGs.
+"""Random braille art: a random source image, dithered into braille cells.
 
-The same random dot pattern is written twice, once in white and once in black,
-so the two files are exact colorways of each other. Every pixel not covered by a
-braille dot is fully transparent.
+The textures that look best are photos converted to braille: they have shapes,
+sharp edges, smooth tonal gradients and, in empty areas, the regular dotted
+lines that braille converters draw when they pad blank cells. Independent coin
+flips per dot cannot produce any of that. So this generator follows the same
+pipeline as the converter, with the source image drawn at random:
+
+    random source image  ->  tone map  ->  dither to dots  ->  pad empty cells
+    (clouds / waves /        (fade ramp,    (Floyd-Steinberg,   (dots 7+8, as
+     ridges + curves)         figures)       Bayer or random)    the converter)
+
+Cells sit on an exact integer lattice (no warp, no jitter), and the default
+"laze" style reproduces the pixel grid measured from real converter output:
+8x17 px cells, 2px dots, 4px dot pitch, 3.67px row pitch at --font-size 17.
+Double --font-size for crisp dots on high-DPI screens.
+
+Everything is reproducible from one seed; each run draws a fresh one unless
+--seed is given. --tile writes a seamless repeating tile for web backgrounds.
 """
 
 from __future__ import annotations
@@ -10,569 +24,658 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
+from dataclasses import dataclass, replace
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
-# Braille cell: two columns of four dots.
-CELL_DOTS_X = 2
-CELL_DOTS_Y = 4
+# --- Braille cell -----------------------------------------------------------
+
+DOTS_X = 2
+DOTS_Y = 4
+SLOTS = DOTS_X * DOTS_Y
+
+# Unicode braille bit order: bit i of the code point offset is the dot at
+# (row, col) below. Dots 1-3 run down the left column, 4-6 down the right, then
+# 7 (left) and 8 (right) sit in the bottom row.
+BIT_POS = ((0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1), (3, 0), (3, 1))
+BOTTOM_ROW = (6, 7)  # bits of dots 7 and 8, the padding converters use
 
 # --- Tunables ---------------------------------------------------------------
 
-# Output image size in pixels.
 OUTPUT_WIDTH = 2048
-OUTPUT_HEIGHT =  10240
+OUTPUT_HEIGHT = 10240
 
-# Size of one braille cell, as its width in output pixels. Cells are always
-# twice as tall as they are wide (2 columns of 4 dots at an even pitch), so
-# this single number sets how large the braille reads. Bigger = bolder and
-# chunkier, smaller = finer texture.
-#
-# Must leave DOT_PITCH at or above MIN_DOT_PITCH. Below that a circle cannot be
-# rasterised: at a 6px pitch the dot's middle rows come out uniform across the
-# full width, so it reads as a square with clipped corners rather than a circle,
-# and supersampling does not help because the limit is in the final pixels.
-BRAILLE_SIZE = 20
+# The em square in output pixels; every font metric is a fraction of it.
+# 17 reproduces the measured converter grid exactly (8x17 px cells).
+FONT_SIZE = 17
 
-# Distance in output pixels between neighbouring dot centres, derived from the
-# cell size so the 2x4 dot layout stays evenly spaced.
-DOT_PITCH = BRAILLE_SIZE / CELL_DOTS_X
-
-# Fraction of the canvas height that stays completely solid before the fade
-# begins. Set to 0.0 for a gradient that starts declining at the very first row.
+# Defaults used by --fixed (and as the centre of the random ranges).
 FULL_BAND = 0.4
-
-# Falloff exponent applied below FULL_BAND. 1.0 is linear, > 1 keeps the image
-# dense for longer then drops off a cliff near the bottom, < 1 thins out early.
 FALLOFF_EXP = 1.6
-
-# Smallest dot pitch, in output pixels, at which a disc still reads as a circle.
-# Measured by counting uniform inner rows in the rasterised dot: 6px and 8px
-# both give two, so the dot has square sides; 10px and up give none, so the disc
-# has a real curve. Supersampling cannot rescue a pitch below this, because the
-# limit is in the final pixels, not in how the disc was drawn.
-MIN_DOT_PITCH = 10
-
-# Render at least N times the output resolution, then downsample for antialiased
-# edges. The actual scale is raised to the smallest multiple that makes
-# DOT_PITCH a whole number of pixels, so the downscale is always an exact integer
-# ratio and never softens the dots.
-#
-# It is also raised to MIN_DOT_BLOCK's requirement, which buys the disc enough
-# pixels to show a circular profile before downsampling.
-SUPERSAMPLE = 1
-
-# Smallest dot block size, in pixels, at which the disc is round enough to
-# survive downsampling to the output pitch. At a 10px pitch a scale of 2 gives
-# a 20px block, enough for a clean curve at the 10x2 downscale.
-MIN_DOT_BLOCK = 20
-
-# Dot diameter as a fraction of DOT_PITCH. Below 1.0 leaves a visible gap
-# between neighbouring dots. Very close to 1.0 merges neighbouring dots into a
-# lattice, so a little space is kept.
-DOT_FILL = 0.9
-
-# --- Distortion figures -----------------------------------------------------
-
-# Random curves scattered over the canvas, each of a random kind (arc, coil or
-# S-curve). They modulate dot density in soft ridges rather than carving
-# shapes, so no region is ever left empty.
 FIGURE_COUNT = 90
-
-# Feature size range in output pixels. Keep these small relative to the canvas
-# for a fine, local distortion; large values read as sweeping blotches.
+DENSITY_PULL = 0.30
 FIGURE_MIN_PX = 200
 FIGURE_MAX_PX = 800
 
-# Peak density change a figure can apply, as a fraction. Capped well below 1.0
-# so figures can never punch holes in a dense area.
-DENSITY_PULL = 0.30
+DIRECTIONS = ("down", "up", "left", "right", "radial", "flat")
+SOURCES = ("clouds", "waves", "ridges")
+DITHERS = ("fs", "bayer", "random", "threshold")
+FILLS = ("bottom", "none")
 
-# Maximum dot displacement from the grid warp, in output pixels. Small values
-# smear the braille without hiding the cell structure.
-WARP_PX = 3.0
-
-# Scale of the smooth noise driving the warp, in output pixels. Larger values
-# bend the grid over longer distances.
-WARP_SCALE_PX = 900.0
-
-# (filename, rgb) pairs written from the same random pattern.
-COLORWAYS = (
-    ("braille-white.png", (255, 255, 255)),
-    ("braille-black.png", (0, 0, 0)),
-)
-
-OUT_DIR = "."
+OUT_DIR = "out"
 
 
-# --- Geometry ---------------------------------------------------------------
+@dataclass(frozen=True)
+class Style:
+    """Braille glyph metrics, in em."""
 
-# A cell is measured in whole output pixels, so an odd BRAILLE_SIZE rounds the
-# cell to the nearest even width and the pitch follows from that.
-CELL_W = int(round(BRAILLE_SIZE / CELL_DOTS_X) * CELL_DOTS_X)
-CELL_H = CELL_W * CELL_DOTS_Y // CELL_DOTS_X
-DOT_PITCH = CELL_W / CELL_DOTS_X
+    advance: float  # cell width (horizontal advance)
+    line: float  # cell height (line pitch)
+    pitch_x: float  # distance between the two dot columns
+    pitch_y: float  # distance between neighbouring dot rows
+    diameter: float  # dot diameter
 
 
-def render_scale() -> int:
-    """Smallest scale that makes the dot pitch whole *and* the disc round.
+STYLES = {
+    # Measured from converted images (4166x3060 px): columns every 4px with no
+    # extra gap between cells, rows at 2.5/6.5/9.5/13.5 within a 17px line,
+    # dots 2px across. Expressed against a 17px em.
+    "laze": Style(advance=0.470, line=1.000, pitch_x=0.235, pitch_y=0.2157, diameter=0.118),
+    # IPAexGothic's 1.0 em line height with typical braille glyph proportions.
+    "ipaex": Style(advance=0.600, line=1.000, pitch_x=0.225, pitch_y=0.225, diameter=0.140),
+    # Measured from DejaVu Sans U+28FF: wider cells, taller lines.
+    "dejavu": Style(advance=0.732, line=1.164, pitch_x=0.293, pitch_y=0.277, diameter=0.146),
+}
+DEFAULT_STYLE = "laze"
 
-    Two constraints, both integer multiples of SUPERSAMPLE:
 
-      * DOT_PITCH * scale must be a whole number of pixels. An odd BRAILLE_SIZE
-        gives a fractional pitch (11px cells put dots 5.5px apart), and
-        rendering fractional blocks loses dot area to the rescaler.
-      * DOT_PITCH * scale must be at least MIN_DOT_BLOCK, so the disc has enough
-        pixels across to show a circular profile instead of a rounded square.
-    """
-    for scale in range(SUPERSAMPLE, SUPERSAMPLE * 64 + 1):
-        pitch = DOT_PITCH * scale
-        if pitch.is_integer() and pitch >= MIN_DOT_BLOCK:
-            return scale
-    raise ValueError(
-        f"no scale in range makes DOT_PITCH={DOT_PITCH} whole and >= {MIN_DOT_BLOCK}px"
+def style_from_font(path: str, line_height: float | None = None) -> Style:
+    """Measure a Style from the U+28FF glyph (all eight dots) of a font file."""
+    try:
+        from fontTools.pens.recordingPen import DecomposingRecordingPen
+        from fontTools.ttLib import TTFont
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit("--font-file needs fontTools: pip install fonttools") from exc
+
+    font = TTFont(path)
+    em = font["head"].unitsPerEm
+    cmap = font.getBestCmap()
+    if 0x28FF not in cmap:
+        raise SystemExit(f"{path} has no braille glyphs (U+28FF missing)")
+    name = cmap[0x28FF]
+    glyphs = font.getGlyphSet()
+    pen = DecomposingRecordingPen(glyphs)
+    glyphs[name].draw(pen)
+
+    contours: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    for op, args in pen.value:
+        if op == "moveTo":
+            current = [args[0]]
+        elif op in ("lineTo", "qCurveTo", "curveTo"):
+            current += [a for a in args if a]
+        elif op in ("closePath", "endPath"):
+            contours.append(current)
+            current = []
+    if len(contours) != SLOTS:
+        raise SystemExit(f"U+28FF has {len(contours)} contours, expected {SLOTS} dots")
+
+    cx, cy, size = [], [], []
+    for pts in contours:
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        cx.append((min(xs) + max(xs)) / 2 / em)
+        cy.append((min(ys) + max(ys)) / 2 / em)
+        size.append(((max(xs) - min(xs)) + (max(ys) - min(ys))) / 2 / em)
+
+    cx, cy = np.sort(cx), np.sort(cy)
+    pitch_x = float(cx[4:].mean() - cx[:4].mean())
+    rows = cy.reshape(4, 2).mean(axis=1)
+    pitch_y = float((rows[3] - rows[0]) / 3)
+    hhea = font["hhea"]
+    line = line_height or (hhea.ascent - hhea.descent + hhea.lineGap) / em
+    return Style(
+        advance=font["hmtx"][name][0] / em,
+        line=float(line),
+        pitch_x=pitch_x,
+        pitch_y=pitch_y,
+        diameter=float(np.mean(size)),
     )
 
 
-def cell_grid() -> tuple[int, int]:
-    """Return the (columns, rows) of whole braille cells that fit the canvas."""
-    return int(OUTPUT_WIDTH // CELL_W), int(OUTPUT_HEIGHT // CELL_H)
+# --- Layout -----------------------------------------------------------------
 
 
-def grid_shape() -> tuple[int, int]:
-    """Return the dot-grid size as (rows, cols), matching the stamped pattern."""
-    cols, rows = cell_grid()
-    return rows * CELL_DOTS_Y, cols * CELL_DOTS_X
+@dataclass(frozen=True)
+class Layout:
+    """Integer cell lattice plus one antialiased sprite per dot slot."""
+
+    cell_w: int
+    cell_h: int
+    cols: int
+    rows: int
+    pad_x: int  # leftover pixels are split evenly, so the grid stays centred
+    pad_y: int
+    # per slot: (y offset in cell, x offset in cell, coverage 0..255 sprite)
+    sprites: tuple
+
+    @property
+    def dot_shape(self) -> tuple[int, int]:
+        return self.rows * DOTS_Y, self.cols * DOTS_X
 
 
-def check_geometry() -> None:
-    """Report any output pixels left over, which stay fully transparent."""
-    used_w, used_h = cell_grid()[0] * CELL_W, cell_grid()[1] * CELL_H
-    if used_w != OUTPUT_WIDTH or used_h != OUTPUT_HEIGHT:
-        print(
-            f"note: braille grid covers {used_w}x{used_h} of "
-            f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}; the remainder is transparent"
-        )
+def dot_sprite(cx: float, cy: float, radius: float, supersample: int = 16):
+    """Antialiased disc centred at (cx, cy) in cell coordinates."""
+    x0 = int(np.floor(cx - radius)) - 1
+    y0 = int(np.floor(cy - radius)) - 1
+    size = int(np.ceil(2 * radius)) + 3
+    axis = (np.arange(size * supersample) + 0.5) / supersample
+    xs = x0 + axis[None, :]
+    ys = y0 + axis[:, None]
+    inside = (xs - cx) ** 2 + (ys - cy) ** 2 <= radius**2
+    cover = inside.reshape(size, supersample, size, supersample).mean(axis=(1, 3))
+    return y0, x0, np.rint(cover * 255).astype(np.uint8)
 
 
-def row_density() -> np.ndarray:
-    """Per-cell-row fill probability, 1.0 across FULL_BAND then fading to 0."""
-    _, rows = cell_grid()
-    y = np.arange(rows) / rows
+def make_layout(style: Style, font_size: int, width: int, height: int, snap: bool = True) -> Layout:
+    cell_w = max(1, int(round(style.advance * font_size)))
+    cell_h = max(1, int(round(style.line * font_size)))
+    cols, rows = width // cell_w, height // cell_h
+    if cols < 1 or rows < 1:
+        raise SystemExit("canvas is smaller than one braille cell")
 
-    fade = np.clip((1.0 - y) / (1.0 - FULL_BAND), 0.0, 1.0)
-    return np.where(y <= FULL_BAND, 1.0, fade**FALLOFF_EXP)
+    radius = style.diameter * font_size / 2
+    px, py = style.pitch_x * font_size, style.pitch_y * font_size
+    # Snapping puts every dot centre on a whole pixel (an even-width dot is
+    # centred on a pixel edge, an odd one on a pixel centre), like hinted
+    # glyphs. Without it, tiny dots land on different fractions and render with
+    # visibly different brightness from row to row.
+    off = 0.0 if int(round(2 * radius)) % 2 == 0 else 0.5
+    sprites = []
+    for row, col in BIT_POS:
+        cx = cell_w / 2 + (col - 0.5) * px
+        cy = cell_h / 2 + (row - 1.5) * py
+        if snap:
+            cx, cy = round(cx - off) + off, round(cy - off) + off
+        y0, x0, cover = dot_sprite(cx, cy, radius)
+        # The sprite carries a 1px antialiasing margin that may poke past the
+        # cell edge while being empty; crop it, and fail only on real coverage.
+        top, left = max(0, -y0), max(0, -x0)
+        bottom = max(0, y0 + cover.shape[0] - cell_h)
+        right = max(0, x0 + cover.shape[1] - cell_w)
+        h, w = cover.shape
+        inner = cover[top : h - bottom, left : w - right]
+        if inner.sum() != cover.sum():
+            raise SystemExit(
+                "dots do not fit inside the cell: lower the dot pitch/diameter, "
+                "raise --line-height or raise --font-size"
+            )
+        sprites.append((y0 + top, x0 + left, np.ascontiguousarray(inner)))
+
+    return Layout(
+        cell_w=cell_w,
+        cell_h=cell_h,
+        cols=cols,
+        rows=rows,
+        pad_x=(width - cols * cell_w) // 2,
+        pad_y=(height - rows * cell_h) // 2,
+        sprites=tuple(sprites),
+    )
 
 
-def figure_curve(rng: np.random.Generator) -> tuple[np.ndarray, float, float]:
-    """Return (points, width, sign) for one random distortion curve.
+# --- Source image: periodic value noise -------------------------------------
 
-    Three kinds are drawn: a wide arc, a tight coil, or an elongated S-curve.
-    Each is a cubic sampled densely enough that the distance field below sees a
-    smooth ridge rather than a polyline.
+
+def smoothstep(lo: float, hi: float, x: np.ndarray) -> np.ndarray:
+    t = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def sample_noise(lattice: np.ndarray, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Smooth value noise at float lattice coordinates; wraps at the edges.
+
+    Because the lattice wraps, every field built from it tiles seamlessly.
     """
-    size = float(rng.uniform(FIGURE_MIN_PX, FIGURE_MAX_PX))
-    cx, cy = rng.uniform(0.0, OUTPUT_WIDTH), rng.uniform(0.0, OUTPUT_HEIGHT)
+    ny, nx = lattice.shape
+    iy, ix = np.floor(y).astype(np.int64), np.floor(x).astype(np.int64)
+    fy, fx = y - iy, x - ix
+    fy, fx = fy * fy * (3 - 2 * fy), fx * fx * (3 - 2 * fx)
+    y0, y1 = iy % ny, (iy + 1) % ny
+    x0, x1 = ix % nx, (ix + 1) % nx
+    top = lattice[y0, x0] * (1 - fx) + lattice[y0, x1] * fx
+    bot = lattice[y1, x0] * (1 - fx) + lattice[y1, x1] * fx
+    return top * (1 - fy) + bot * fy
+
+
+def fbm(rng, v, u, ny: int, nx: int, octaves: int, gain: float = 0.55, dv=0.0, du=0.0):
+    """Fractal noise on the unit canvas, normalised to roughly [0, 1].
+
+    v, u are fractions of the canvas height/width; (dv, du) displace the sample
+    point in base-lattice units, which is how domain warping is done.
+    """
+    total = 0.0
+    amp, norm = 1.0, 0.0
+    for k in range(octaves):
+        f = 2**k
+        lattice = rng.random((ny * f, nx * f)).astype(np.float32)
+        total = total + amp * sample_noise(lattice, (v * ny + dv) * f, (u * nx + du) * f)
+        norm += amp
+        amp *= gain
+    return total / norm
+
+
+def source_tone(rng, rows: int, cols: int, p: "Params", width: int, height: int) -> np.ndarray:
+    """A random grayscale 'photo' at dot resolution, values in [0, 1]."""
+    v = ((np.arange(rows) + 0.5) / rows)[:, None]
+    u = ((np.arange(cols) + 0.5) / cols)[None, :]
+    feature = max(p.feature, 16.0)
+    ny = max(1, int(round(height / feature)))
+    nx = max(1, int(round(width / feature)))
+
+    # One low-frequency field drives the warp; the rest differs per kind.
+    wy = fbm(rng, v, u, ny, nx, 3) - 0.5
+    wx = fbm(rng, v, u, ny, nx, 3) - 0.5
+    dv, du = p.warp * 2 * wy, p.warp * 2 * wx
+
+    if p.source == "clouds":
+        b = fbm(rng, v, u, ny, nx, 6, dv=dv, du=du)
+    elif p.source == "ridges":
+        f = fbm(rng, v, u, ny, nx, 5, dv=dv, du=du)
+        b = (1.0 - np.abs(2.0 * f - 1.0)) ** 2
+    else:  # waves: stretched swell + fine chop, strongly warped so nothing is periodic
+        f = fbm(rng, v, u, ny * 4, max(1, nx // 3), 6, gain=0.6, dv=dv * 0.8, du=du * 0.8)
+        chop = fbm(rng, v, u, ny * 10, max(1, nx), 3, dv=dv, du=du)
+        cycles = max(3, int(round(height / (feature / 4.0))))
+        ripple = 0.5 + 0.5 * np.sin(2 * np.pi * (v * cycles + 1.5 * p.warp * wy + 2.0 * (f - 0.5)))
+        b = 0.25 * ripple + 0.50 * f + 0.25 * chop
+
+    lo, hi = np.percentile(b, (2.0, 98.0))
+    b = np.clip((b - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+
+    # Edge shaping: blend the smooth tone with a hard threshold of it, so some
+    # areas keep gradients and others get the crisp silhouettes of a photo.
+    centre = rng.uniform(0.35, 0.65)
+    half = 0.02 + 0.25 * (1.0 - p.edge)
+    shaped = (1.0 - p.edge) * b + p.edge * smoothstep(centre - half, centre + half, b)
+    return shaped**p.gamma
+
+
+# --- Tone: fade ramp + figure strokes ---------------------------------------
+
+
+def fade_ramp(rows: int, cols: int, direction: str, full_band: float, exp: float, flat: float):
+    """Fill probability: 1.0 across `full_band`, then fading to 0."""
+    y = ((np.arange(rows) + 0.5) / rows)[:, None] * np.ones((1, cols))
+    x = np.ones((rows, 1)) * ((np.arange(cols) + 0.5) / cols)[None, :]
+    if direction == "flat":
+        return np.full((rows, cols), flat)
+    if direction == "down":
+        t = y
+    elif direction == "up":
+        t = 1.0 - y
+    elif direction == "right":
+        t = x
+    elif direction == "left":
+        t = 1.0 - x
+    elif direction == "radial":
+        t = np.clip(np.hypot(2 * (x - 0.5), 2 * (y - 0.5)) / np.sqrt(2.0), 0.0, 1.0)
+    else:
+        raise ValueError(f"unknown direction {direction!r}")
+    fade = np.clip((1.0 - t) / (1.0 - full_band), 0.0, 1.0)
+    return np.where(t <= full_band, 1.0, fade**exp)
+
+
+def figure_curve(rng: np.random.Generator, width: int, height: int, lo=FIGURE_MIN_PX, hi=FIGURE_MAX_PX):
+    """One random curve: returns (points in px, ridge width in px, sign).
+
+    Three kinds: a wide arc, a tight coil, or an elongated S-curve, each a
+    cubic sampled densely enough to read as a smooth stroke.
+    """
+    size = float(rng.uniform(lo, hi))
+    centre = np.array([rng.uniform(0.0, width), rng.uniform(0.0, height)])
     angle = rng.uniform(0.0, 2.0 * np.pi)
     along = np.array([np.cos(angle), np.sin(angle)])
     across = np.array([-np.sin(angle), np.cos(angle)])
 
     kind = rng.integers(0, 3)
-    if kind == 0:
-        # Arc: a single bow, offset sideways to one side.
+    if kind == 0:  # arc
         bend = size * rng.uniform(0.4, 0.9) * rng.choice((-1.0, 1.0))
-        p0 = np.array([cx, cy]) - along * size
-        p1 = np.array([cx, cy]) + along * size
+        p0, p1 = centre - along * size, centre + along * size
         c0 = p0 + along * size * 0.5 + across * bend
         c1 = p1 - along * size * 0.5 + across * bend
-    elif kind == 1:
-        # Coil: a curl that wraps roughly a turn and a half.
-        p0 = np.array([cx, cy])
+    elif kind == 1:  # coil
+        p0 = centre
         p1 = p0 + along * size
-        c0 = p0 + np.array([across[0], across[1]]) * size * 0.6 + along * size * 0.2
-        c1 = p1 - np.array([across[0], across[1]]) * size * 0.6 - along * size * 0.2
-    else:
-        # S-curve: a long stroke that reverses sideways once.
-        p0 = np.array([cx, cy]) - along * size
-        p1 = np.array([cx, cy]) + along * size
+        c0 = p0 + across * size * 0.6 + along * size * 0.2
+        c1 = p1 - across * size * 0.6 - along * size * 0.2
+    else:  # S-curve
+        p0, p1 = centre - along * size, centre + along * size
         swing = size * rng.uniform(0.5, 1.0) * rng.choice((-1.0, 1.0))
         c0 = p0 + along * size * 0.3 + across * swing
         c1 = p1 - along * size * 0.3 - across * swing
 
     t = np.linspace(0.0, 1.0, 96)[:, None]
     inv = 1.0 - t
-    pts = (
-        inv**3 * p0
-        + 3 * inv**2 * t * c0
-        + 3 * inv * t**2 * c1
-        + t**3 * p1
-    )
-
-    # The ridge is much narrower than the curve is long, so each figure reads as
-    # a fine band. A width near the curve size would blanket the canvas and act
-    # as one global density shift instead of local texture.
-    width = size * rng.uniform(0.04, 0.10)
-    return pts, width, float(rng.choice((-1.0, 1.0)))
+    pts = inv**3 * p0 + 3 * inv**2 * t * c0 + 3 * inv * t**2 * c1 + t**3 * p1
+    ridge = size * rng.uniform(0.04, 0.10)
+    return pts, ridge, float(rng.choice((-1.0, 1.0)))
 
 
-def figure_field(rng: np.random.Generator, shape: tuple[int, int]) -> np.ndarray:
-    """Sum a soft ridge per figure into a density offset bounded by DENSITY_PULL.
+def figure_field(rng, layout: Layout, count: int, pull: float, width: int, height: int,
+                 wrap: bool = False, size_range=(FIGURE_MIN_PX, FIGURE_MAX_PX)) -> np.ndarray:
+    """Soft signed ridges along random curves, at dot resolution, in +-`pull`.
 
-    The ridge is a Gaussian falloff in distance to the curve, so figures read as
-    soft bands of thicker and thinner braille rather than as hard outlines.
-    Because every contribution is clamped to DENSITY_PULL, no figure can empty a
-    region that the base ramp wants filled.
+    Each curve is drawn as a thin line and blurred, which gives a Gaussian
+    ridge for a fraction of the cost of a per-dot distance field. With `wrap`
+    the curve is also drawn shifted by one canvas in every direction, so a
+    ridge leaving one edge re-enters on the opposite one (seamless tiles).
     """
-    rows, cols = shape
-    ys, xs = np.mgrid[0:rows, 0:cols].astype(np.float32)
-    # Dot-grid coordinates to output pixels.
-    px = xs * DOT_PITCH + DOT_PITCH / 2
-    py = ys * DOT_PITCH + DOT_PITCH / 2
+    rows, cols = layout.dot_shape
+    sx, sy = layout.cell_w / DOTS_X, layout.cell_h / DOTS_Y  # px per dot
+    shifts = [(dx, dy) for dx in (-width, 0, width) for dy in (-height, 0, height)] if wrap else [(0, 0)]
 
-    field = np.zeros(shape, dtype=np.float32)
-    for _ in range(FIGURE_COUNT):
-        pts, width, sign = figure_curve(rng)
-        qx = pts[:, 0]
-        qy = pts[:, 1]
-
-        # Squared distance to the nearest curve sample. Split into column bands
-        # so the broadcast stays within a sane memory footprint.
-        d2 = np.full(shape, np.inf, dtype=np.float32)
-        band = max(1, cols // 8)
-        for start in range(0, cols, band):
-            stop = min(start + band, cols)
-            dx = px[:, start:stop, None] - qx
-            dy = py[:, start:stop, None] - qy
-            d2[:, start:stop] = np.min(dx * dx + dy * dy, axis=2)
-
-        ridge = np.exp(-d2 / (2.0 * width**2)).astype(np.float32)
-        field += sign * ridge
-
-    np.clip(field, -DENSITY_PULL, DENSITY_PULL, out=field)
-    return field
+    field = np.zeros((rows, cols), dtype=np.float32)
+    for _ in range(count):
+        pts, ridge, sign = figure_curve(rng, width, height, *size_range)
+        canvas = Image.new("L", (cols, rows), 0)
+        draw = ImageDraw.Draw(canvas)
+        for dx, dy in shifts:
+            xs = (pts[:, 0] + dx - layout.pad_x) / sx
+            ys = (pts[:, 1] + dy - layout.pad_y) / sy
+            draw.line(list(zip(xs.tolist(), ys.tolist())), fill=255, width=1)
+        sigma = max(1.0, ridge / ((sx + sy) / 2))
+        arr = np.asarray(canvas.filter(ImageFilter.GaussianBlur(sigma)), dtype=np.float32)
+        peak = arr.max()
+        if peak > 0:
+            field += sign * arr / peak
+    return np.clip(field, -pull, pull)
 
 
-def smooth_noise(rng: np.random.Generator, shape: tuple[int, int], scale: float) -> np.ndarray:
-    """Smooth 2D noise in [-1, 1] from a coarse random lattice, smoothly upsampled."""
-    rows, cols = shape
-    coarse_r = max(2, int(rows * DOT_PITCH / scale) + 2)
-    coarse_c = max(2, int(cols * DOT_PITCH / scale) + 2)
-
-    lattice = rng.uniform(-1.0, 1.0, (coarse_r, coarse_c)).astype(np.float32)
-    img = Image.fromarray(lattice, "F").resize((cols, rows), Image.BICUBIC)
-    noise = np.asarray(img, dtype=np.float32)
-
-    return np.clip(noise, -1.0, 1.0)
+# --- Dithering --------------------------------------------------------------
 
 
-def warp_offsets(rng: np.random.Generator, shape: tuple[int, int]) -> np.ndarray:
-    """Per-dot (dy, dx) displacement in dot-grid units, bounded by WARP_PX.
-
-    Two noise fields are combined into a divergence-free-ish flow so the grid
-    bends and smears like heat haze rather than sliding uniformly. Offsets are
-    applied when each dot is stamped, so dots never blur or double.
-    """
-    field_y = smooth_noise(rng, shape, WARP_SCALE_PX)
-    field_x = smooth_noise(rng, shape, WARP_SCALE_PX * 1.7)
-
-    limit = WARP_PX / DOT_PITCH
-    mag = np.hypot(field_y, field_x)
-    over = mag > limit
-    scale = np.where(over, limit / np.maximum(mag, 1e-6), 1.0)
-
-    return np.stack([field_y * scale, field_x * scale])
+def bayer_matrix(n: int) -> np.ndarray:
+    m = np.array([[0]])
+    while m.shape[0] < n:
+        m = np.block([[4 * m, 4 * m + 2], [4 * m + 3, 4 * m + 1]])
+    return m
 
 
-def dot_pattern(rng: np.random.Generator, field: np.ndarray | None = None) -> np.ndarray:
-    """Return the filled-dot mask at dot-grid resolution, shape (y, x).
+def floyd_steinberg(tone: np.ndarray) -> np.ndarray:
+    """Serpentine Floyd-Steinberg error diffusion; True where a dot is lit."""
+    h, w = tone.shape
+    buf = tone.astype(np.float64).tolist()
+    out = np.zeros((h, w), dtype=bool)
+    for y in range(h):
+        row = buf[y]
+        nxt = buf[y + 1] if y + 1 < h else None
+        d = 1 if y % 2 == 0 else -1
+        xs = range(w) if d == 1 else range(w - 1, -1, -1)
+        lit = []
+        for x in xs:
+            old = row[x]
+            new = 1.0 if old > 0.5 else 0.0
+            if new:
+                lit.append(x)
+            err = old - new
+            xn = x + d
+            if 0 <= xn < w:
+                row[xn] += err * 0.4375
+            if nxt is not None:
+                if 0 <= x - d < w:
+                    nxt[x - d] += err * 0.1875
+                nxt[x] += err * 0.3125
+                if 0 <= xn < w:
+                    nxt[xn] += err * 0.0625
+        out[y, lit] = True
+    return out
 
-    Dots are numbered the braille way: down the left column first, then the
-    right, so the texture reads as braille rather than as random confetti.
-    `field` is an optional per-dot density offset from the figure curves.
-    """
-    cols, rows = cell_grid()
-    ramp = row_density()[:, None]
-    if field is None:
-        density = ramp
+
+def dither(rng, tone: np.ndarray, method: str) -> np.ndarray:
+    if method == "fs":
+        return floyd_steinberg(tone)
+    if method == "bayer":
+        n = 8
+        thr = (bayer_matrix(n) + 0.5) / (n * n)
+        reps = (-(-tone.shape[0] // n), -(-tone.shape[1] // n))
+        return tone > np.tile(thr, reps)[: tone.shape[0], : tone.shape[1]]
+    if method == "random":
+        return rng.random(tone.shape) < tone
+    return tone > 0.5
+
+
+def cells_from_dots(dots: np.ndarray) -> np.ndarray:
+    """(rows*4, cols*2) dot mask -> (rows, cols, 8) with slot i = braille bit i."""
+    return np.stack([dots[r::DOTS_Y, c::DOTS_X] for r, c in BIT_POS], axis=-1)
+
+
+# --- Random parameters ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Params:
+    direction: str
+    full_band: float
+    falloff: float
+    flat: float
+    figures: int
+    pull: float
+    source: str
+    feature: float  # source feature size, px
+    warp: float  # domain-warp strength, in lattice cells
+    edge: float  # 0 = smooth gradients, 1 = hard silhouettes
+    floor: float  # tone floor so dark areas keep a trace of dots
+    gamma: float  # >1 darkens the source: sparse bright detail on dark, like a photo
+
+
+def random_params(rng: np.random.Generator, args, width: int) -> Params:
+    """Draw every look parameter from the seed unless the user pinned it."""
+    if args.fixed:
+        drawn = Params("down", FULL_BAND, FALLOFF_EXP, 0.5, FIGURE_COUNT, DENSITY_PULL,
+                       "waves", 0.3 * width, 1.4, 0.6, 0.05, 1.8)
     else:
-        # field arrives at dot resolution (rows*4, cols*2); reshape to cells.
-        per_cell = field.reshape(rows, CELL_DOTS_Y, cols, CELL_DOTS_X).mean(axis=(1, 3))
-        # Fade the figures out along with the ramp. Otherwise a positive figure
-        # would refill rows the gradient has already emptied, and the fade would
-        # stop reading as a fade.
-        weight = np.clip(ramp / max(DENSITY_PULL, 1e-6), 0.0, 1.0)
-        density = np.clip(ramp + per_cell * weight, 0.0, 1.0)
-
-    samples = rng.random((rows, cols, CELL_DOTS_X * CELL_DOTS_Y))
-    filled = samples < density[..., None]
-
-    # Slots run down the left column, then the right: dots 1-4, then 5-8.
-    slots = np.arange(CELL_DOTS_X * CELL_DOTS_Y)
-    slot_row = slots % CELL_DOTS_Y
-    slot_col = slots // CELL_DOTS_Y
-
-    # (cell_row, cell_col, slot) -> (dot_row, dot_col)
-    dot_row = np.arange(rows)[:, None, None] * CELL_DOTS_Y + slot_row
-    dot_col = np.arange(cols)[None, :, None] * CELL_DOTS_X + slot_col
-
-    grid = np.zeros((rows * CELL_DOTS_Y, cols * CELL_DOTS_X), dtype=bool)
-    grid[dot_row, dot_col] = filled
-    return grid
+        drawn = Params(
+            direction=str(rng.choice(DIRECTIONS, p=[0.30, 0.15, 0.10, 0.10, 0.25, 0.10])),
+            full_band=float(rng.uniform(0.15, 0.55)),
+            falloff=float(rng.uniform(1.0, 2.4)),
+            flat=float(rng.uniform(0.55, 0.90)),
+            figures=int(rng.integers(20, 71)),
+            pull=float(rng.uniform(0.15, 0.35)),
+            source=str(rng.choice(SOURCES)),
+            feature=float(rng.uniform(0.12, 0.45) * width),
+            warp=float(rng.uniform(0.6, 2.2)),
+            edge=float(rng.uniform(0.3, 0.9)),
+            floor=float(rng.uniform(0.0, 0.12)),
+            gamma=float(rng.uniform(1.0, 2.8)),
+        )
+    if args.tile:  # a repeating tile cannot carry a gradient: CSS does the fade
+        drawn = replace(drawn, direction="flat", figures=int(rng.integers(6, 15)))
+        if args.fixed:
+            drawn = replace(drawn, figures=10)
+    return replace(drawn, direction=args.direction or drawn.direction, source=args.source or drawn.source)
 
 
-def dot_kernel() -> np.ndarray:
-    """A filled circle inscribed in one supersampled DOT_PITCH square."""
-    size = int(round(DOT_PITCH * render_scale()))
-    radius = size * DOT_FILL / 2.0
-    centre = (size - 1) / 2.0
-    offsets = np.arange(size) - centre
-
-    dist = np.hypot(offsets[:, None], offsets[None, :])
-    return dist <= radius
+# --- Rendering --------------------------------------------------------------
 
 
-def render_alpha(
-    pattern: np.ndarray, offsets: np.ndarray | None = None
-) -> Image.Image:
-    """Stamp the dot mask into a coverage buffer and downsample it to final size.
+def render_alpha(pattern: np.ndarray, layout: Layout, width: int, height: int) -> np.ndarray:
+    """Stamp each dot slot's sprite into every cell that has it; uint8 (h, w)."""
+    cells = np.zeros((layout.rows, layout.cell_h, layout.cols, layout.cell_w), dtype=np.uint8)
+    for bit, (y0, x0, cover) in enumerate(layout.sprites):
+        h, w = cover.shape
+        mask = pattern[:, :, bit]
+        region = cells[:, y0 : y0 + h, :, x0 : x0 + w]  # view: (rows, h, cols, w)
+        stamp = mask[:, None, :, None] * cover[None, :, None, :]
+        np.maximum(region, stamp, out=region)  # AA edges of neighbours may touch
 
-    `offsets` is an optional (2, y, x) array of per-dot displacements in dot-grid
-    units. Dots are stamped at their displaced position rather than resampling
-    the finished image, so warping smears the grid without blurring or doubling
-    individual dots.
-    """
-    size = int(round(DOT_PITCH * render_scale()))
-    dot_rows, dot_cols = pattern.shape
-    kernel = dot_kernel()
-
-    if offsets is None:
-        offsets = np.zeros((2, dot_rows, dot_cols), dtype=np.float32)
-    shift_y = np.rint(offsets[0] * DOT_PITCH * size).astype(int)
-    shift_x = np.rint(offsets[1] * DOT_PITCH * size).astype(int)
-
-    # A warped dot can reach outside its own block, so stamp into a buffer with
-    # a margin and crop it back out after. The margin comes from the measured
-    # shift so it cannot fall short of the real displacement.
-    margin = int(max(abs(shift_y).max(), abs(shift_x).max())) + 1
-    height = dot_rows * size + 2 * margin
-    width = dot_cols * size + 2 * margin
-    strips = np.zeros((height, width), dtype=np.uint8)
-
-    base_y = np.repeat(np.arange(dot_rows) * size, dot_cols).reshape(dot_rows, dot_cols)
-    base_x = np.tile(np.arange(dot_cols) * size, (dot_rows, 1))
-    origin_y = base_y + shift_y + margin
-    origin_x = base_x + shift_x + margin
-
-    # Scatter each filled dot once per nonzero kernel pixel. maximum.at keeps
-    # overlapping dots from summing past full coverage.
-    filled_y, filled_x = np.nonzero(pattern)
-    if filled_y.size:
-        for ky, kx in np.argwhere(kernel):
-            np.maximum.at(
-                strips,
-                (origin_y[filled_y, filled_x] + ky, origin_x[filled_y, filled_x] + kx),
-                np.uint8(255),
-            )
-
-    # Downsample to the whole-cell grid, not straight to the output size: a
-    # partial cell at the edge would otherwise get stretched to fill the
-    # remainder instead of staying absent.
-    cells_x, cells_y = cell_grid()
-    cropped = strips[margin : margin + dot_rows * size, margin : margin + dot_cols * size]
-    grid = Image.fromarray(cropped, "L").resize(
-        (cells_x * CELL_W, cells_y * CELL_H), Image.LANCZOS
-    )
-
-    canvas = Image.new("L", (OUTPUT_WIDTH, OUTPUT_HEIGHT), 0)
-    canvas.paste(grid, (0, 0))
+    grid = cells.reshape(layout.rows * layout.cell_h, layout.cols * layout.cell_w)
+    canvas = np.zeros((height, width), dtype=np.uint8)
+    canvas[
+        layout.pad_y : layout.pad_y + grid.shape[0],
+        layout.pad_x : layout.pad_x + grid.shape[1],
+    ] = grid
     return canvas
 
 
-def write_colorway(alpha: Image.Image, rgb: tuple[int, int, int], path: str) -> None:
-    """Composite the coverage buffer over a solid color and save it."""
-    image = Image.new("RGBA", (OUTPUT_WIDTH, OUTPUT_HEIGHT), rgb + (255,))
-    image.putalpha(alpha)
-    image.save(path, "PNG")
+def to_text(pattern: np.ndarray) -> str:
+    """The same pattern as real Unicode braille characters, one line per row."""
+    codes = (pattern.astype(np.uint16) << np.arange(SLOTS)).sum(axis=-1)
+    return "\n".join("".join(chr(0x2800 + int(c)) for c in row) for row in codes)
+
+
+def write_image(alpha: np.ndarray, ink, bg, path: str, mask: bool = False) -> None:
+    """Save as PNG/WebP (by extension). `mask` stores coverage only, one channel."""
+    lossless = {"lossless": True, "method": 6} if path.endswith(".webp") else {"optimize": True}
+    if mask:  # use as CSS mask-image: colour and background come from the page
+        Image.fromarray(alpha, "L").save(path, **lossless)
+        return
+    layer = Image.new("RGBA", alpha.shape[::-1], ink + (255,))
+    layer.putalpha(Image.fromarray(alpha, "L"))
+    if bg is not None:
+        base = Image.new("RGBA", alpha.shape[::-1], bg + (255,))
+        layer = Image.alpha_composite(base, layer)
+    layer.save(path, **lossless)
 
 
 # --- Verification -----------------------------------------------------------
 
 
-def check_density(pattern: np.ndarray) -> None:
-    """Assert the rendered pattern honours the requested fade.
-
-    Thresholds carry DENSITY_PULL because the figures deliberately thin a
-    nominally full row, so the top band is no longer expected to be 1.0.
-    """
-    rows = pattern.shape[0] // CELL_DOTS_Y
-    per_row = pattern.reshape(rows, -1).mean(axis=1)
-    expected = row_density()
-
-    top = per_row[: max(1, rows // 20)].mean()
-    bottom = per_row[-max(1, rows // 20) :].mean()
-
-    # A row the ramp calls full may still be pulled down by DENSITY_PULL.
-    assert top > 1.0 - DENSITY_PULL - 0.02, f"top band is not near-full: {top:.3f}"
-    assert bottom < 0.02 + DENSITY_PULL * 0.1, f"bottom band is not empty: {bottom:.3f}"
-
-    worst = float(np.max(np.abs(per_row - expected)))
-    assert worst <= DENSITY_PULL + 0.05, f"per-row density deviates by {worst:.3f}"
-
-    # Monotonic and seam-free, asserted against the measurement itself rather
-    # than against row_density(), so a flaw in that function cannot hide here.
-    # A seam shows up as one row dropping far more than the smooth trend.
-    # Without figures the steepest legitimate step is ~0.033, but figures
-    # legitimately vary a row by up to DENSITY_PULL, so the bound scales with
-    # them. A mis-scaled fade drops 0.83 in a single row, far outside this.
-    tol = DENSITY_PULL * 0.8
-    step = np.diff(per_row)
-    assert step.max() <= tol, f"density rises downward: {step.max():.3f}"
-    assert step.min() >= -tol, f"density drops by {step.min():.3f} in one row (seam?)"
-
-
-def check_render(alpha: Image.Image) -> None:
-    """Assert the downsampled coverage buffer actually holds 0..255 coverage."""
-    coverage = np.asarray(alpha, dtype=np.uint8)
-
-    assert coverage.max() > 250, f"no opaque coverage rendered: max {coverage.max()}"
-    assert coverage.min() == 0, f"no empty pixels rendered: min {coverage.min()}"
-
-    # This checks the renderer, not the art: a solid full-density pattern with no
-    # figures and no warp must come back at the disc's own area fraction. The
-    # 6% slack absorbs LANCZOS edge weighting across the supersample downscale,
-    # measured at 3.6% for the round 18px disc. A 6px block loses far less
-    # because its disc is already a blocky square.
-    dot_area = float(dot_kernel().mean())
-    solid = render_alpha(np.ones(grid_shape(), dtype=bool))
-    solid_cov = np.asarray(solid, dtype=np.uint8)
-    cell_rows = int(OUTPUT_HEIGHT // CELL_H)
-    band = cell_rows // 8
-    top = solid_cov[: band * CELL_H].mean() / 255
-    assert abs(top - dot_area) < 0.06 * dot_area, f"solid coverage {top:.3f} vs {dot_area:.3f}"
-
-    # The real render must not be emptier than the figures allow, and must not
-    # exceed a solid field.
-    top_art = coverage[: band * CELL_H].mean() / 255
-    floor = dot_area * (1.0 - DENSITY_PULL) - 0.02
-    assert top_art > floor, f"top art coverage {top_art:.3f} below floor {floor:.3f}"
-    assert top_art <= dot_area + 0.02, f"top art coverage {top_art:.3f} above solid {dot_area:.3f}"
-
-
-def check_dots() -> None:
-    """Assert the dot a viewer actually sees is a circle, not a rounded square.
-
-    Measured on the *final* output pixels, not on the pre-downsample kernel: a
-    disc drawn large and downsampled still lands on a rounded square if the
-    output pitch is too small, because the limit is in the final pixels.
-
-    The test counts uniform inner rows in an isolated rendered dot. A disc has
-    no row that is fully opaque across its whole width; a rasterised square does.
-    """
-    pitch = int(round(DOT_PITCH))
-    assert pitch >= MIN_DOT_PITCH, (
-        f"DOT_PITCH={pitch} is below MIN_DOT_PITCH={MIN_DOT_PITCH}: a circle "
-        f"cannot be rasterised that small. Raise BRAILLE_SIZE to "
-        f"{MIN_DOT_PITCH * CELL_DOTS_X} or more."
-    )
-
-    # Render one isolated dot at output size through the real pipeline.
-    size = int(round(DOT_PITCH * render_scale()))
-    off = np.arange(size) - (size - 1) / 2.0
-    disc = np.hypot(off[:, None], off[None, :]) <= size * DOT_FILL / 2.0
-
-    buffer = np.zeros((size, 3 * size), dtype=np.uint8)
-    for i in range(3):
-        buffer[:, i * size : (i + 1) * size] = np.where(disc, 255, 0)
-    strip = Image.fromarray(buffer, "L").resize((3 * pitch, pitch), Image.LANCZOS)
-    dot = np.asarray(strip)[:, :pitch]
-
-    uniform = [
-        r
-        for r in range(1, pitch - 1)
-        if dot[r].min() > 200 and dot[r].max() > 240
+def check_alignment(layout: Layout, style: Style, font_size: int) -> None:
+    """Assert the lattice is exact: every cell renders pixel-identically."""
+    full = np.ones((layout.rows, layout.cols, SLOTS), dtype=bool)
+    width = layout.pad_x * 2 + layout.cols * layout.cell_w
+    height = layout.pad_y * 2 + layout.rows * layout.cell_h
+    alpha = render_alpha(full, layout, width, height)
+    grid = alpha[
+        layout.pad_y : layout.pad_y + layout.rows * layout.cell_h,
+        layout.pad_x : layout.pad_x + layout.cols * layout.cell_w,
     ]
-    assert not uniform, (
-        f"dot rasterises as a square: rows {uniform} are uniform across the full "
-        f"width at a {pitch}px pitch. Raise BRAILLE_SIZE."
+    tiles = grid.reshape(layout.rows, layout.cell_h, layout.cols, layout.cell_w)
+    assert (tiles == tiles[0:1, :, 0:1, :]).all(), "cells are not pixel-identical"
+
+    # Coverage of a full cell must equal eight discs of the requested diameter.
+    expected = SLOTS * np.pi * (style.diameter * font_size / 2) ** 2
+    measured = float(tiles[0, :, 0, :].sum()) / 255
+    assert abs(measured - expected) < 0.06 * expected, (
+        f"dot area {measured:.1f}px vs {expected:.1f}px expected"
     )
 
 
-def check_figures(field: np.ndarray) -> None:
-    """Assert the figure curves cannot punch holes or swamp the base ramp.
-
-    The figures are meant to be a small perturbation. This is the guard against
-    them growing strong enough to blank out a dense region, which would read as
-    a bald patch rather than as texture.
-    """
-    ramp = row_density()[:, None]
-    assert np.abs(field).max() <= DENSITY_PULL + 1e-6, (
-        f"figure field exceeds DENSITY_PULL: {np.abs(field).max():.3f}"
-    )
-
-    # Mirror dot_pattern exactly: average the figure field to per cell, weight
-    # it by the ramp, then apply. Measuring a different formula than the one
-    # under test would let a hole slip through.
-    # cell_grid() returns (columns, rows).
-    cols, rows = cell_grid()
-    base = np.repeat(ramp, CELL_DOTS_Y, axis=0)
-    per_cell = field.reshape(rows, CELL_DOTS_Y, cols, CELL_DOTS_X).mean(axis=(1, 3))
-    weight = np.clip(ramp / max(DENSITY_PULL, 1e-6), 0.0, 1.0)
-    per_row = np.clip(ramp + per_cell * weight, 0.0, 1.0)
-
-    # A figure may only ever nudge a row's density by DENSITY_PULL, so the
-    # per-row deviation from the base ramp has a hard ceiling.
-    dev = np.abs(per_row - ramp).max()
-    assert dev <= DENSITY_PULL + 1e-6, f"figures shift row density by {dev:.3f}"
-
-    # Nothing may be emptied where the base ramp is dense. A hole shows up as a
-    # cell row whose density is far below what the ramp asked for.
-    dense = ramp[:, 0] > 0.5
-    if dense.any():
-        lost = (ramp[dense, 0, None] - per_row[dense]).max()
-        assert lost <= DENSITY_PULL + 1e-6, f"figures empty a dense region by {lost:.3f}"
+def check_dither(dots: np.ndarray, tone: np.ndarray, method: str) -> None:
+    """Assert dithering preserved the average tone (error diffusion must)."""
+    if method == "threshold":
+        return
+    gap = abs(float(dots.mean()) - float(tone.mean()))
+    assert gap < 0.03, f"{method} dithering drifted: dots {dots.mean():.3f} vs tone {tone.mean():.3f}"
 
 
 # --- Entry point ------------------------------------------------------------
 
 
+def parse_color(text: str) -> tuple[int, int, int]:
+    text = text.lstrip("#")
+    if len(text) != 6:
+        raise argparse.ArgumentTypeError("colour must be 6 hex digits, e.g. 101820")
+    return tuple(int(text[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--seed",
-        help="hex token from secrets; omit to draw a fresh one and print it",
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--count", type=int, default=1, help="how many images to generate")
+    parser.add_argument("--seed", help="hex seed for one image; omit for a fresh random one")
+    parser.add_argument("--width", type=int, help=f"default {OUTPUT_WIDTH}, or ~512 with --tile")
+    parser.add_argument("--height", type=int, help=f"default {OUTPUT_HEIGHT}, or ~512 with --tile")
+    parser.add_argument("--font-size", type=int, default=FONT_SIZE, help="em size in px (17 = measured grid)")
+    parser.add_argument("--style", choices=sorted(STYLES), default=DEFAULT_STYLE)
+    parser.add_argument("--font-file", help="measure glyph metrics from this TTF/OTF instead")
+    parser.add_argument("--line-height", type=float, help="override line height, in em")
+    parser.add_argument("--no-snap", action="store_true", help="keep sub-pixel dot centres (default: snap to whole pixels)")
+    parser.add_argument("--source", choices=SOURCES, help="pin the kind of random source image")
+    parser.add_argument("--dither", choices=DITHERS, default="fs", help="how the source becomes dots")
+    parser.add_argument("--fill", choices=FILLS, default="bottom",
+                        help="pad empty cells with dots 7+8 like braille converters do, or leave blank")
+    parser.add_argument("--direction", choices=DIRECTIONS, help="pin the fade direction")
+    parser.add_argument("--fixed", action="store_true", help="use the constants, not random looks")
+    parser.add_argument("--ink", choices=("white", "black", "both"), default="both")
+    parser.add_argument("--bg", type=parse_color, help="opaque background hex, e.g. 101820")
+    parser.add_argument("--tile", action="store_true",
+                        help="seamless repeating tile (size snapped to whole cells, no gradient)")
+    parser.add_argument("--webp", action="store_true", help="write lossless WebP instead of PNG (much smaller)")
+    parser.add_argument("--mask", action="store_true",
+                        help="one-channel coverage mask (use with CSS mask-mode: luminance); RGBA is simpler")
+    parser.add_argument("--txt", action="store_true", help="also write Unicode braille text")
     parser.add_argument("--out-dir", default=OUT_DIR)
     args = parser.parse_args()
 
-    token = secrets.token_bytes(32)
-    seed = args.seed or token.hex()
-    if args.seed is None:
-        print(f"seed: {seed}")
+    if args.font_file:
+        style = style_from_font(args.font_file, args.line_height)
+    else:
+        style = STYLES[args.style]
+        if args.line_height:
+            style = replace(style, line=args.line_height)
 
-    rng = np.random.default_rng(
-        np.random.SeedSequence(int.from_bytes(bytes.fromhex(seed), "big"))
+    args.width = args.width or (512 if args.tile else OUTPUT_WIDTH)
+    args.height = args.height or (512 if args.tile else OUTPUT_HEIGHT)
+    layout = make_layout(style, args.font_size, args.width, args.height, not args.no_snap)
+    if args.tile:
+        # Whole cells only, so the lattice lines up across the wrap: no seam.
+        args.width, args.height = layout.cols * layout.cell_w, layout.rows * layout.cell_h
+        layout = make_layout(style, args.font_size, args.width, args.height, not args.no_snap)
+        assert layout.pad_x == 0 and layout.pad_y == 0
+    check_alignment(layout, style, args.font_size)
+    print(
+        f"grid {layout.cols}x{layout.rows} cells of {layout.cell_w}x{layout.cell_h}px "
+        f"(em {args.font_size}px, dot {style.diameter * args.font_size:.1f}px)"
     )
 
-    check_geometry()
-
-    # Figures and warp consume the same generator, so a given seed reproduces
-    # the exact same texture end to end.
-    field = figure_field(rng, grid_shape())
-    check_figures(field)
-    offsets = warp_offsets(rng, grid_shape())
-
-    check_dots()
-    pattern = dot_pattern(rng, field)
-    check_density(pattern)
-    alpha = render_alpha(pattern, offsets)
-    check_render(alpha)
-
+    inks = {"white": (255, 255, 255), "black": (0, 0, 0)}
+    chosen = ("white", "black") if args.ink == "both" else (args.ink,)
     os.makedirs(args.out_dir, exist_ok=True)
-    for filename, rgb in COLORWAYS:
-        path = f"{args.out_dir}/{filename}"
-        write_colorway(alpha, rgb, path)
-        print(f"wrote {path}  {OUTPUT_WIDTH}x{OUTPUT_HEIGHT}")
+    rows_d, cols_d = layout.dot_shape
+
+    for n in range(args.count):
+        seed = args.seed if (args.seed and args.count == 1) else secrets.token_bytes(32).hex()
+        rng = np.random.default_rng(np.random.SeedSequence(int.from_bytes(bytes.fromhex(seed), "big")))
+
+        p = random_params(rng, args, args.width)
+        tone = source_tone(rng, rows_d, cols_d, p, args.width, args.height)
+        ramp = fade_ramp(rows_d, cols_d, p.direction, p.full_band, p.falloff, p.flat)
+        short = min(args.width, args.height)
+        size_range = (0.12 * short, 0.50 * short) if args.tile else (FIGURE_MIN_PX, FIGURE_MAX_PX)
+        field = figure_field(rng, layout, p.figures, p.pull, args.width, args.height,
+                             wrap=args.tile, size_range=size_range)
+
+        # Figures fade out with the ramp so they cannot refill emptied areas.
+        weight = np.clip(ramp / max(p.pull, 1e-6), 0.0, 1.0)
+        target = np.clip(ramp * (p.floor + (1.0 - p.floor) * tone) + field * weight, 0.0, 1.0)
+
+        dots = dither(rng, target, args.dither)
+        check_dither(dots, target, args.dither)
+        pattern = cells_from_dots(dots)
+        if args.fill == "bottom":
+            empty = ~pattern.any(axis=-1)
+            for bit in BOTTOM_ROW:
+                pattern[:, :, bit] |= empty
+        alpha = render_alpha(pattern, layout, args.width, args.height)
+
+        stem = f"braille-{seed[:8]}"
+        print(
+            f"[{n + 1}/{args.count}] seed: {seed}\n"
+            f"    {p.source}, fade {p.direction}, band {p.full_band:.2f}, edge {p.edge:.2f}, "
+            f"warp {p.warp:.1f}, {p.figures} figures, dither {args.dither}"
+        )
+        ext = "webp" if args.webp else "png"
+        # A mask has no colour of its own, so one file serves every colourway.
+        for name in (("mask",) if args.mask else chosen):
+            path = os.path.join(args.out_dir, f"{stem}{'-tile' if args.tile else ''}-{name}.{ext}")
+            write_image(alpha, inks.get(name), args.bg, path, mask=args.mask)
+            kb = os.path.getsize(path) / 1024
+            print(f"    wrote {path} {args.width}x{args.height} ({kb:.0f} KB)")
+        if args.txt:
+            path = os.path.join(args.out_dir, f"{stem}.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(to_text(pattern) + "\n")
+            print(f"    wrote {path}")
 
 
 if __name__ == "__main__":
